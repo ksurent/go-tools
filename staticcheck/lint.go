@@ -9,6 +9,7 @@ import (
 	"go/types"
 	htmltemplate "html/template"
 	"net/http"
+	"os"
 	"regexp"
 	"regexp/syntax"
 	"sort"
@@ -243,6 +244,7 @@ func (c *Checker) Funcs() map[string]lint.Func {
 		"SA1022": nil,
 		"SA1023": c.CheckWriterBufferModified,
 		"SA1024": c.callChecker(checkUniqueCutsetRules),
+		"SA1025": c.CheckHTTPTransportWithoutDefaults,
 
 		"SA2000": c.CheckWaitgroupAdd,
 		"SA2001": c.CheckEmptyCriticalSection,
@@ -2786,5 +2788,58 @@ func (c *Checker) CheckMissingEnumTypesInDeclaration(j *lint.Job) {
 	}
 	for _, f := range j.Program.Files {
 		ast.Inspect(f, fn)
+	}
+}
+
+// TODO(asurikov): this should probably be per runtime version.
+var defaultTransportSettings = []string{
+	"DialContext",
+	"MaxIdleConns",
+	"IdleConnTimeout",
+	"TLSHandshakeTimeout",
+	"ExpectContinueTimeout",
+}
+
+func (c *Checker) CheckHTTPTransportWithoutDefaults(j *lint.Job) {
+	const checkText = "built new Transport without any of the default settings; consider copying settings from DefaultTransport"
+
+	for _, fn := range j.Program.InitialFunctions {
+		for _, blck := range fn.Blocks {
+			for _, instr := range blck.Instrs {
+				alloc, ok := instr.(*ssa.Alloc)
+				if !ok {
+					continue
+				}
+
+				if !IsType(Dereference(alloc.Type()), "net/http.Transport") {
+					continue
+				}
+
+				var hasDefault bool
+				for _, ins := range *alloc.Referrers() {
+					faddr, ok := ins.(*ssa.FieldAddr)
+					if !ok {
+						continue
+					}
+
+					named := Dereference(faddr.X.Type()).(*types.Named)
+					fieldName := named.Underlying().(*types.Struct).Field(faddr.Field).Id()
+					for _, v := range defaultTransportSettings {
+						if v == fieldName {
+							hasDefault = true
+							break
+						}
+					}
+				}
+
+				if !hasDefault {
+					if alloc.Pos() != token.NoPos {
+						j.Errorf(alloc, checkText)
+					} else {
+						fmt.Fprintf(os.Stderr, "Detected but can't report: %s in %s\n", alloc.String(), fn.Name())
+					}
+				}
+			}
+		}
 	}
 }
