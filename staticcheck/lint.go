@@ -238,6 +238,7 @@ func (c *Checker) Funcs() map[string]lint.Func {
 		"SA1022": nil,
 		"SA1023": c.CheckWriterBufferModified,
 		"SA1024": c.callChecker(checkUniqueCutsetRules),
+		"SA1025": c.CheckHTTPTransportWithoutDefaults,
 
 		"SA2000": c.CheckWaitgroupAdd,
 		"SA2001": c.CheckEmptyCriticalSection,
@@ -2774,5 +2775,177 @@ func (c *Checker) CheckMissingEnumTypesInDeclaration(j *lint.Job) {
 	}
 	for _, f := range j.Program.Files {
 		ast.Inspect(f, fn)
+	}
+}
+
+var defaultTransportSettings = []string{
+	"DialContext",
+	"MaxIdleConns",
+	"IdleConnTimeout",
+	"TLSHandshakeTimeout",
+	"ExpectContinueTimeout",
+}
+
+func (c *Checker) CheckHTTPTransportWithoutDefaults(j *lint.Job) {
+	const checkText = "built new Transport without any of the default settings; consider copying settings from DefaultTransport"
+
+	// Check if e is a net/http.Transport struct and contains any kv-exprs with
+	// default transport settings.
+	//
+	// http.Transport{}                     -> true, false
+	// http.Transport{MaxIdleConns: 42}     -> true, true
+	// http.Transport{TLSClientConfig: nil} -> true, false
+	// http.Client{}                        -> false, false
+	transportWithoutDefaults := func(e ast.Expr) (bool, bool) {
+		unary, ok := e.(*ast.UnaryExpr)
+		if ok {
+			e = unary.X
+		}
+
+		lit, ok := e.(*ast.CompositeLit)
+		if !ok {
+			return false, false
+		}
+
+		sel, ok := lit.Type.(*ast.SelectorExpr)
+		if !ok || j.SelectorName(sel) != "net/http.Transport" {
+			return false, false
+		}
+
+		for _, elt := range lit.Elts {
+			kv, ok := elt.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+
+			for _, k := range defaultTransportSettings {
+				if lint.IsIdent(kv.Key, k) {
+					// If at least one default setting is present, assume it's intentional.
+					return true, true
+				}
+			}
+		}
+
+		return true, false
+	}
+
+	candidates := make(map[*types.Var]*ast.Ident)
+
+	// Checks if e is a selector-expr where the expression is a net/http.Transport
+	// and the selector is a default transport setting.
+	//
+	// tr.MaxIdleConns    -> *types.Var, true
+	// tr.TLSClientConfig -> nil, false
+	defaultSettingAssignment := func(e ast.Expr) (*types.Var, bool) {
+		sel, ok := e.(*ast.SelectorExpr)
+		if !ok {
+			return nil, false
+		}
+
+		id, ok := sel.X.(*ast.Ident)
+		if !ok {
+			return nil, false
+		}
+
+		v, ok := j.Program.Info.ObjectOf(id).(*types.Var)
+		if !ok {
+			return nil, false
+		}
+
+		if _, ok := candidates[v]; !ok {
+			return nil, false
+		}
+
+		for _, k := range defaultTransportSettings {
+			if sel.Sel.Name == k {
+				return v, true
+			}
+		}
+
+		return nil, false
+	}
+
+	// Handle assignments in the following forms:
+	// tr := http.Transport{...}
+	// tr.MaxIdleConns = 42
+	assignHandler := func(assign *ast.AssignStmt) {
+		for i, rhs := range assign.Rhs {
+			isTransport, hasDefaults := transportWithoutDefaults(rhs)
+			if !isTransport {
+				continue
+			}
+
+			id, ok := assign.Lhs[i].(*ast.Ident)
+			if !ok {
+				continue
+			}
+
+			v, ok := j.Program.Info.ObjectOf(id).(*types.Var)
+			if !ok {
+				continue
+			}
+
+			if hasDefaults {
+				delete(candidates, v)
+			} else {
+				candidates[v] = id
+			}
+		}
+
+		for _, lhs := range assign.Lhs {
+			if v, ok := defaultSettingAssignment(lhs); ok {
+				delete(candidates, v)
+			}
+		}
+	}
+
+	// Handle declarations in the following forms:
+	// var tr http.Transport
+	// var (tr http.Transport)
+	declHandler := func(decl *ast.GenDecl) {
+		for _, spec := range decl.Specs {
+			val, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+
+			for _, id := range val.Names {
+				v, ok := j.Program.Info.ObjectOf(id).(*types.Var)
+				if !ok || deref(v.Type()).String() != "net/http.Transport" {
+					continue
+				}
+
+				candidates[v] = id
+			}
+		}
+	}
+
+	kvHandler := func(kv *ast.KeyValueExpr) {
+		isTransport, hasDefaults := transportWithoutDefaults(kv.Value)
+		if !isTransport || hasDefaults {
+			return
+		}
+
+		j.Errorf(kv.Value, checkText)
+	}
+
+	fn := func(node ast.Node) bool {
+		switch typedNode := node.(type) {
+		case *ast.AssignStmt:
+			assignHandler(typedNode)
+		case *ast.GenDecl:
+			declHandler(typedNode)
+		case *ast.KeyValueExpr:
+			kvHandler(typedNode)
+		}
+
+		return true
+	}
+
+	for _, f := range j.Program.Files {
+		ast.Inspect(f, fn)
+	}
+	for _, node := range candidates {
+		j.Errorf(node, checkText)
 	}
 }

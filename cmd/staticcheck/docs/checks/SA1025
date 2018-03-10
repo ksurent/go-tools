@@ -1,0 +1,1 @@
+net/http.DefaultTransport is used by net/http.Client unless overridden, and contains some useful settings, e.g. a DialContext with a sensible timeout. Using a new Transport instance will not copy those settings.
