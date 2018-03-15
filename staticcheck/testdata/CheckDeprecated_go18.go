@@ -20,7 +20,7 @@ func fn1(err error) {
 	}
 	var _ flate.ReadError // MATCH /No longer returned/
 
-	var tr *http.Transport
+	tr := &http.Transport{MaxIdleConns: 42}
 	tr.CancelRequest(nil) // MATCH "CancelRequest is deprecated"
 
 	var conn driver.Conn

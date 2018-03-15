@@ -20,7 +20,7 @@ func fn1(err error) {
 	}
 	var _ flate.ReadError
 
-	var tr *http.Transport
+	tr := &http.Transport{MaxIdleConns: 42}
 	tr.CancelRequest(nil)
 
 	var conn driver.Conn
